@@ -156,8 +156,101 @@ Bez kredytów, bez PRODUCER/CONSUMER, bez `push`/`pop`. Surowa pamięć. NOC mo�
 **Dlaczego DFB → scratchpad?**  
 DFB jest od przekazywania tile’y między rolami. Payload (`c0`) tak działa: reader wypełnia, writer opróżnia — zostawiamy.
 
-Indeksy to notatnik na starcie: dwa małe tensory, jeden kernel, zero downstream. DFB wymaga pary ról, więc scratchpad stawał się nielegalnym self-loopem. Scratchpad jest na working memory. Sam `TT_FATAL` mówi: *Consider using a scratchpad.*
+Indeksy to notatnik na starcie: dwa małe tensory, jeden kernel, zero downstream. DFB wymaga pary ról, więc scratchpad stawał się niegitm self-loopem. Scratchpad jest na working memory. Sam `TT_FATAL` mówi: *Consider using a scratchpad.*
 
 Czytanie zostaje (`noc.async_read` + barrier). Zmieniamy typ miejsca, nie algorytm slice’a.
 
+
+### Review — Copilot (Quasar coverage)
+
+Copilot: WH nie łapie Gen2 `TT_FATAL`, test byłby zielony na starym kodzie. Puścić na QSR sim i wpiąć w test matrix.
+
+- **O co:** stary self-loop jest git na WH, niegit na Quasar. Pytest na WH sprawdza slice, nie ten `TT_FATAL`.
+- **Feedback:** mechanika OK. Nie blokować. Nie wpinamy w `quasar_sim_regresion_tests.yaml` — to gtest na emu-quasar, nie pytest ttnn; ttsim i tak nie dowiezie ULP.
+
+Co już jest / co zrobiliśmy:
+
+1. Ban w `ProgramSpecTestQuasar.CPU_DMKernelSelfLoopOnGen2Fails` — mock Quasar, bez sim. To jest Gen2 coverage walidatora.
+2. ttsim device `TTSimTTDevice`, kernel `-DARCH_QUASAR`. Program się zbudował (DFB config zapisany na core) → **nie było** self-loop fatal. Potem ISA dziura w ttsim, nie w naszym specu.
 </details>
+
+
+<summary><h2>Item 7 - tilize DRAM-sharded in, zero-copy factory</h2></summary>
+
+- branch: `51271-quasar-dm-ports`, commit `46bc2d2f461`
+- twin: mainline `tilize` #49213 (`92178172347`). Quasar fork (`fe163380087`) jest sprzed tego fixa.
+
+### Problem
+
+- Sharded optimized tilize (`TilizeMultiCoreShardedProgramFactory`) nie kopiuje shardu. DFB jest `borrowed_from` bufora tensora — ten sam L1 co shard, zero-copy. Reader tylko `push_back`; dane już „są” w CB.
+- Circular buffer / borrowed DFB **musi** siedzieć w L1. DRAM nie może mieć CB (`Only L1 buffers can have an associated circular buffer!`).
+- `can_use_sharded_optimized_factories` sprawdzało DRAM tylko na **output** (osobno HEIGHT i WIDTH). Input `buffer_type()` nigdzie. DRAM-sharded in + L1-sharded out zwracało `true` → ta factory → throw przy budowie programu. Op w ogóle nie wstaje.
+- Gdyby borrow z DRAM jakoś przeszedł, reader i tak nic nie rusza z DRAM — compute tilizowałby śmieci z L1.
+- Case z issue (i test): RM `(1,1,2048,64)` bf16, HEIGHT_SHARDED 4 cores, shard `(512,64)`, input DRAM, output L1, ten sam spec. Mainline regression łapał DRAM **out**; quasar to już odrzucał. Dziura to DRAM **in** + L1 out.
+
+### Podejścia
+
+- **Wybrane:** na górze guard: input i output muszą być L1. Jak mainline. Stare per-layout `if output == DRAM return false` stają się zbędne — wywalamy.
+- Nie „naprawiamy” borrow, żeby brał DRAM. CB tam nie mieszka.
+- Nie dokładamy kopiowania DRAM→L1 w optimized factory. To job default factory (`TilizeMultiCoreDefaultProgramFactory`): prawdziwy stick reader przez NOC.
+- Sam check na input, bez output, zostawiłby DRAM-out dziurę którą stare linie łatały. Oba L1, jeden early return.
+
+### Rozwiązanie
+
+- `tilize_device_operation.cpp`: po ND_SHARDED, `buffer_type() != L1` na in i out → `return false`. `select_program_factory` wtedy idzie w default, nie w sharded optimized.
+- WIDTH TILE_HEIGHT check zostaje (to nie DRAM).
+
+### Wynik
+
+- Repro: `test_quasar_tilize_dram_sharded_input_to_l1_sharded_output`. Przed: throw. Po: tilize przez default factory, dane = torch.
+
+### Pytania / odpowiedzi
+
+**Co to zero-copy / borrow?**  
+Zamiast osobnego bufora na tile’e, DFB wskazuje na L1 sharda tensora. Kernel nie DMA-uje inputu — traktuje shard jak CB. Tanie, tylko gdy shard już jest w L1.
+
+**Czemu default factory jest OK na DRAM in?**  
+Nie pożycza bufora tensora jako CB. Czyta sticki NOC-em do prawdziwego L1 DFB, potem compute. Wolniej, legalne.
+</details>
+
+
+<details>
+<summary><h2>Item 9 - untilize HS shard height, kilka macierzy na core</h2></summary>
+
+- branch: `51271-quasar-dm-ports`, commit `f9a287ce940`
+- twin: mainline `untilize_with_unpadding` w `db3d7e91445` („Fix to_layout without an explicit memory_config”). Quasar znowu snapshot sprzed fixa.
+- Publiczny trigger: `experimental.quasar.to_layout(..., ROW_MAJOR)` na sharded TILE trzyma ten sam shard layout i woła `untilize_with_unpadding`.
+
+### Problem
+
+- HEIGHT_SHARDED → HEIGHT_SHARDED output shard height było zawsze `round_up(div_up(fused_height, num_cores), tile_height)`.
+- To jest OK, gdy **jedna** macierz jest pocięta na core’y (batch == 1): output shard ≈ tile-aligned kawałek wysokości.
+- Gdy jeden core trzyma **kilka** pełnych macierzy (`batch > 1`), writer liczy `num_unpadded_rows_per_batch = out_shard_h / batch`. Shard height musi być dokładnie `batch * logical_H`. Round-up do tile psuje to dzielenie.
+- Shape z issue: `(32, 32, 17, 64)` bf16 TILE (pad H=32), HS 64 cores, shard `(512, 64)`. `batch = (512*64)/(32*64) = 16` macierzy na core. `fused_height = 32*32*17 = 17408`. Stary wzór: `div_up(17408, 64)=272`, `round_up(272, 32)=288`. Writer: `288/16=18` wierszy na macierz zamiast 17. Kopiuje wiersz paddingu z tile’a i stawia następną macierz co 18 → śmieci od drugiej macierzy. Call wraca, output zły.
+- Test sprawdza i shape sharda `(16*17, 64)=(272, 64)`, i dane vs torch.
+
+### Podejścia
+
+- **Wybrane:** to samo `batch` co writer. `batch > 1` → `shard_idx0 = batch * output_shape[-2]`. `batch == 1` → stary tile round-up (issue #16620, macierz pocięta na core’y).
+- Nie ruszamy writera, żeby brał `logical_H` zamiast `out_shard_h / batch`. Kontrakt zostaje; host musi dać dobry shard.
+- Nie stosujemy `batch * logical_H` zawsze. Przy batch==1 round-up nadal potrzebny.
+
+### Rozwiązanie
+
+- `untilize_with_unpadding_device_operation.cpp` `compute_output_specs`: `batch = max(1, (in_shard_h * in_shard_w) / (padded_H * padded_W))`, potem if/else jak mainline.
+
+### Wynik
+
+- Repro: `test_quasar_to_layout_height_sharded_batched_unpad` — dokładny shape z issue.
+
+### Pytania / odpowiedzi
+
+**Co to `batch` tutaj?**  
+Ile pełnych padded macierzy (ostatnie dwa wymiary) mieści się w jednym shardzie. Nie batch z NCHW na sztywno — liczone z `shard_volume / (padded_H * padded_W)`. Tu 16.
+
+**Czemu 288 vs 272?**  
+272 = 16 macierzy × 17 prawdziwych wierszy. 288 = 272 zaokrąglone w górę do 32 (tile). Writer myśli, że każda macierz ma `288/16=18` wierszy.
+</details>
+
+
+

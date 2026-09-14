@@ -174,7 +174,7 @@ Co już jest / co zrobiliśmy:
 2. ttsim device `TTSimTTDevice`, kernel `-DARCH_QUASAR`. Program się zbudował (DFB config zapisany na core) → **nie było** self-loop fatal. Potem ISA dziura w ttsim, nie w naszym specu.
 </details>
 
-
+<details>
 <summary><h2>Item 7 - tilize DRAM-sharded in, zero-copy factory</h2></summary>
 
 - branch: `51271-quasar-dm-ports`, commit `46bc2d2f461`

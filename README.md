@@ -4,8 +4,7 @@
 - https://arxiv.org/pdf/2502.10517
 - https://arxiv.org/pdf/2511.13274
 - https://arxiv.org/abs/2506.09092
-- https://huggingface.co/papers/2407.14044
-
+- https://ecco.readthedocs.io/en/main/
 
 
 for accuracy knowledge

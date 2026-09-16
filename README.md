@@ -18,4 +18,4 @@ https://arxiv.org/pdf/2511.11581v1
 ai kernels
 - https://arxiv.org/pdf/2502.10517
 - https://arxiv.org/pdf/2511.13274
-
+- https://arxiv.org/abs/2506.09092

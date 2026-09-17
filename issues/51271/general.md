@@ -1,5 +1,96 @@
 # Notatki o defektach Quasar - #51271 / #56226
 
+
+<details>
+<summary><h2>Item 1 - matmul fused bias, hang na circular bufferze</h2></summary>
+
+<details>
+<summary><h2>Follow-up po item 1 — fused bias z złego banku DRAM (interleaved)</h2></summary>
+- znalezione na review #56597 (Copilot), nie jest w #51271 ani #51222
+- twin: ten sam `bank_id` na mainline (height + non-batched DRAM-sharded). Regular matmul już czyta bias przez `TensorAccessor`
+- **nie** wrzucać w PR hangu. Osobny issue, potem osobny PR
+### O co chodzi
+- Worker DRAM-sharded matmula ma `dram_bank_id` = bank **wag** in1 (`HEIGHT_SHARDED` w DRAM). Każdy worker czyta swój shard in1 z tego banku — to jest OK.
+- Fused bias jest **interleaved** DRAM (`DRAM_MEMORY_CONFIG`). Tile'e są pocięte na strony po bankach, nie skopiowane pod ten sam adres w każdym banku.
+- Kernel biasu robi `{.bank_id = dram_bank_id, .addr = in3_tensor_addr}` — ten sam offset co in1, ale w **banku workera**. To nie jest mapa stron biasu.
+- 1 tile biasu (`N=32`): cała strona 0 siedzi w banku 0. Worker 0 ma dobry bias. Worker 1..N czyta ten sam adres w swoim banku → śmieci w fused output dla tych batchy.
+- Większe `N`: strony striped po bankach. Wtedy nawet worker 0 jest zły, jeśli czyta ciągły zakres bajtów z jednego banku zamiast `page_id`.
+To **nie** jest regresja hoistu. Hoist tylko przeniósł ten sam read przed pętlę. Przed hoistem i tak był ten adres; hang ucinał program zanim dało się to zobaczyć na liczbach.
+### Scope
+Quasar:
+- batched height: `reader_bmm_tile_layout_in1_sender_dram_sharded_height.cpp` + factory `matmul_multicore_reuse_batched_hs_dram_sharded_program_factory.cpp` (dziś zero `TensorAccessorArgs` / `tensor::bias` na tym readerze)
+- non-batched: `reader_bmm_tile_layout_in1_sender_dram_sharded.cpp` — ten sam `dram_bank_id` burst
+Mainline: te same dwa kernele pod `ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/`
+Najmniejszy pierwszy PR: tylko quasar batched height + factory + pełny PCC w istniejącym teście. Reszta checkboxy na issue.
+### Czemu nie było widać wcześniej
+- **Hang pierwszy.** `batches_per_core > 1` → deadlock na drugim `reserve_back`. Drugi batch nigdy nie wracał, nie było pełnego PCC.
+- **Publiczny `linear(..., bias=)` na WH** idzie w post-process `add()`, nie kompiluje `FUSE_BIAS` na tej factory. Testy publicznego API tego readu nie wołają.
+- **Ticket #51271 / #51222** cytował `bank_id` + `in3_tensor_addr` tylko jako „ten sam bias, zero stride batch” (dowód na zbędny re-push). Nie audytowali mapy stron interleaved DRAM.
+- Test regresji hangu **świa­domie** ucina PCC do `ref[:, :batches_per_core]` (bank 0), żeby udowodnić że call wraca, bez udawania że fused bias jest poprawny na wszystkich shardach. Komentarz w teście to właśnie ten bug.
+- Copilot złapał to, bo slice + komentarz w teście robią defect oczywistym po zniknięciu hangu.
+### Podejścia
+- **Wybrane na follow-up:** `TensorAccessor` (albo `tensor::bias` jak metal2 padding reader) i pętla `{.page_id = t}`. Wszyscy workerzy czytają te same strony biasu, niezależnie od banku in1.
+- Nie zostawiać `bank_id` workera i nie zakładać, że bias jest zreplikowany w każdym banku.
+- Nie naprawiać tego w PR #56597 (inny kontrakt: CTA/binding + rebuild factory, nie sam hoist JIT).
+### Rozwiązanie (gdy PR)
+- Kernel: zamiast jednego `async_read` z `dram_bank_id`, pętla po `in3_block_tiles` przez accessor.
+- Factory: `TensorAccessorArgs(*bias_tensor).append_to(...)` albo named `tensor::bias`. Uważać na offset CTA (dziś 10–12 pod FUSE_BIAS) i slot RTA (`in3` = arg 2, `dram_bank_id` = 3).
+- Test: `assert_with_pcc(ref, got)` — bez slice do banku 0.
+### Pytania / odpowiedzi
+**Czemu worker 0 przechodzi PCC?**  
+Przy 1-tile biasu strona 0 jest w banku 0. Worker 0 czyta właściwy bank przypadkiem. To nie znaczy, że addressing jest OK.
+**Czemu in1 może używać `dram_bank_id`, a bias nie?**  
+in1 jest HEIGHT_SHARDED w DRAM: shard workera leży w jego banku. Bias jest interleaved: kolejne page_id skaczą po bankach.
+**To ten sam bug co hang?**  
+Nie. Hang = za dużo `push` na CB `c_3`. Ten bug = skąd NOC bierze bajty biasu. Po hoiscie hang znika, liczby na shardach ≠ bank 0 zostają złe.
+</details>
+
+- branch: `51271-item1-quasar-matmul-bias-cb`, commit `040eee5ed9b`
+- twin: #51222 item 1. Mainline `reader_bmm_tile_layout_in1_sender_dram_sharded_height.cpp` nadal pcha bias w pętli batch.
+
+- found bug: read from the wrong weight bank
+
+### Problem
+
+- Batched HEIGHT_SHARDED DRAM matmul, fused bias. CB `c_3` = jeden block. Hang gdy `batches_per_core > 1`.
+- Reader pushował **ten sam** bias (addr bez offsetu) wewnątrz `for (batch …)`.
+- Compute: `wait` raz, `pop` raz na końcu. Po batch 0 CB pełny → drugi `reserve_back` hang.
+
+### Podejścia
+
+- **Wybrane:** ten sam `reserve` / read / `push` przed pętlę. Jeden `push`, jeden `wait`, jeden `pop`.
+- Nie rosnąć CB i nie pop co batch — compute ma trzymać bias do końca.
+- Nie `TT_FATAL` na `batches_per_core > 1`.
+
+### Rozwiązanie
+
+- W `reader_bmm_tile_layout_in1_sender_dram_sharded_height.cpp`: `cb_in3.reserve_back` / `noc.async_read` / barrier / `push_back` przed `for (batch …)`. W pętli zostaje tylko in1 i zapis outputu.
+- Factory bez zmian (rozmiar CB, `FUSE_BIAS`, `num_blocks_w_dim = 1`).
+
+### Wynik
+
+- Repro: `test_quasar_batched_dram_sharded_matmul_fused_bias_multi_batch` — descriptor + `generic_op`, `FUSE_BIAS=1`, `batches_per_core > 1`. Publiczny `linear` tego nie złapie.
+
+### Pytania / odpowiedzi
+
+**Czemu nie publiczny `linear(..., bias=)`?**  
+Na WH batched in1 → post-process `add()`, nie fused kernel. Test woła factory bezpośrednio.
+
+**Czemu nie rosnnie CB?**  
+Compute i tak popuje raz na końcu. Większy CB bez zmiany compute nadal zostawia kredyty niezgodne, albo wymaga ruszania compute. Hoist pasuje do istniejącego kontraktu.
+</details>
+
+
+<details>
+<summary><h2>Item 2 - refactor to FATAL on gather_in0 DRAM bank map miss</h2></summary>
+
+
+
+
+
+</details>
+
+
 <details>
 <summary><h2>Item 3 - dest stride na unaligned same-width reshard</h2></summary>
 
